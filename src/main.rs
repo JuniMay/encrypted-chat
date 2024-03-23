@@ -5,10 +5,12 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+use crypto::{CryptoProvider, EcdhAesProvider, EcdhDesProvider, RsaProvider};
+use message::{Header, Message};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::{
@@ -26,6 +28,28 @@ mod message;
 struct Arg {
     #[arg(short, long, default_value_t = 4321)]
     port: u16,
+    #[arg(short, long, default_value = "rsa")]
+    crypto: CryptoKind,
+}
+
+#[derive(Clone)]
+enum CryptoKind {
+    Rsa,
+    EcdhAes,
+    EcdhDes,
+}
+
+impl std::str::FromStr for CryptoKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "rsa" => Ok(Self::Rsa),
+            "ecdh-aes" => Ok(Self::EcdhAes),
+            "ecdh-des" => Ok(Self::EcdhDes),
+            _ => Err("Invalid crypto kind".to_string()),
+        }
+    }
 }
 
 struct State {
@@ -38,6 +62,8 @@ struct State {
 
     stream: Option<TcpStream>,
 
+    pub crypto_provider: Box<dyn CryptoProvider>,
+
     stopped: bool,
 }
 
@@ -46,11 +72,11 @@ enum Command {
     Quit,
 }
 
-
 fn main() -> Result<()> {
     let args = Arg::parse();
     let port = args.port;
     let addr = "127.0.0.1".to_string();
+    let crypto_kind = args.crypto;
 
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
@@ -58,7 +84,7 @@ fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
-    let state = Arc::new(Mutex::new(State::new(addr.clone(), port)));
+    let state = Arc::new(Mutex::new(State::new(addr.clone(), port, crypto_kind)));
 
     {
         let tx = tx.clone();
@@ -121,7 +147,12 @@ fn main() -> Result<()> {
 }
 
 impl State {
-    fn new(addr: String, port: u16) -> Self {
+    fn new(addr: String, port: u16, crypto_kind: CryptoKind) -> Self {
+        let provider = match crypto_kind {
+            CryptoKind::Rsa => RsaProvider::initialize(),
+            CryptoKind::EcdhAes => EcdhAesProvider::initialize(),
+            CryptoKind::EcdhDes => EcdhDesProvider::initialize(),
+        };
         Self {
             addr,
             port,
@@ -129,6 +160,7 @@ impl State {
             messages: Vec::new(),
             informations: Vec::new(),
             stream: None,
+            crypto_provider: provider,
             stopped: false,
         }
     }
@@ -188,7 +220,13 @@ impl State {
     fn send(&mut self) {
         self.info("Sending".to_string());
         if let Some(ref mut stream) = self.stream {
-            stream.write(self.curr_input.as_bytes()).unwrap();
+            let msg = self
+                .crypto_provider
+                .encrypt(self.curr_input.clone())
+                .unwrap();
+            let msg = Message::new(Header::Data, msg);
+            let msg = bincode::serialize(&msg).unwrap();
+            stream.write(&msg).unwrap();
             self.user_msg(self.curr_input.clone());
             self.curr_input.clear();
         } else {
@@ -204,6 +242,15 @@ impl State {
         stream.set_nonblocking(true).unwrap();
         self.stream = Some(stream);
         self.info("Connected".to_string());
+
+        self.info("Sending public key".to_string());
+
+        let public_key = self.crypto_provider.public_key().unwrap();
+        let msg = Message::new(Header::Prepare, public_key);
+        let msg = bincode::serialize(&msg).unwrap();
+        self.stream.as_ref().unwrap().write(&msg).unwrap();
+
+        self.info("Sent public key".to_string());
     }
 
     fn submit(&mut self) -> bool {
@@ -287,7 +334,34 @@ fn recv(tx: mpsc::Sender<Vec<u8>>, state: Arc<Mutex<State>>) {
 
                     state.info(format!("Received: {}", n));
                     let msg = buffer[..n].to_vec();
-                    tx.send(msg).unwrap();
+
+                    // deserialize the message
+                    let msg: Message = bincode::deserialize(&msg).unwrap();
+
+                    match msg.header() {
+                        Header::Prepare => {
+                            state.info("Received public key".to_string());
+
+                            if !state.crypto_provider.is_prepared() {
+                                state.crypto_provider.prepare(msg.into_data());
+                            }
+                            // send the public key
+                            state.info("Sending public key".to_string());
+                            let public_key = state.crypto_provider.public_key().unwrap();
+                            let msg = Message::new(Header::Prepare, public_key);
+                            let msg = bincode::serialize(&msg).unwrap();
+                            state.stream.as_ref().unwrap().write(&msg).unwrap();
+                            state.info("Sent public key".to_string());
+                        }
+                        Header::Data => {
+                            let raw = msg.data();
+
+                            state.info(format!("Received data: {:?}", raw));
+
+                            let decrypted = state.crypto_provider.decrypt(msg.into_data()).unwrap();
+                            tx.send(decrypted.into()).unwrap();
+                        }
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => {
@@ -368,9 +442,11 @@ fn ui(frame: &mut Frame, state: Arc<Mutex<State>>) {
     let info_view = Paragraph::new(information_text)
         .block(Block::default().borders(Borders::ALL).title("Info"));
     let msg_view = Paragraph::new(message_text)
-        .block(Block::default().borders(Borders::ALL).title("Messages"));
-    let input_view =
-        Paragraph::new(input).block(Block::default().borders(Borders::ALL).title("Input"));
+        .block(Block::default().borders(Borders::ALL).title("Messages"))
+        .wrap(Wrap { trim: true });
+    let input_view = Paragraph::new(input)
+        .block(Block::default().borders(Borders::ALL).title("Input"))
+        .wrap(Wrap { trim: true });
 
     frame.render_widget(info_view, chunks[0]);
     frame.render_widget(msg_view, chunks[1]);

@@ -105,7 +105,7 @@ impl RsaCrypto {
     }
 }
 
-struct Ecdh {
+pub struct Ecdh {
     group: EcGroup,
     key: PKey<Private>,
 }
@@ -141,6 +141,157 @@ impl Ecdh {
 
         let secret = deriver.derive_to_vec()?;
         Ok(secret)
+    }
+}
+
+pub trait CryptoProvider: Send + Sync {
+    fn initialize() -> Box<dyn CryptoProvider>
+    where
+        Self: Sized;
+    fn prepare(&mut self, peer_public_key: Vec<u8>);
+    fn is_prepared(&self) -> bool;
+    fn public_key(&self) -> Result<Vec<u8>>;
+    fn encrypt(&self, data: String) -> Result<Vec<u8>>;
+    fn decrypt(&self, data: Vec<u8>) -> Result<String>;
+}
+
+pub struct RsaProvider {
+    /// The internal RSA crypto
+    pub rsa: RsaCrypto,
+    /// If the public key is exchanged
+    prepared: bool,
+}
+
+impl CryptoProvider for RsaProvider {
+    fn initialize() -> Box<dyn CryptoProvider> {
+        Box::new(Self {
+            rsa: RsaCrypto::new().unwrap(),
+            prepared: false,
+        })
+    }
+
+    fn is_prepared(&self) -> bool {
+        self.prepared
+    }
+
+    fn prepare(&mut self, peer_public_key: Vec<u8>) {
+        if self.is_prepared() {
+            panic!("Public key is already exchanged");
+        }
+        self.rsa.set_peer_public_key(peer_public_key).unwrap();
+        self.prepared = true;
+    }
+
+    fn public_key(&self) -> Result<Vec<u8>> {
+        self.rsa.public_key()
+    }
+
+    fn encrypt(&self, data: String) -> Result<Vec<u8>> {
+        if !self.prepared {
+            anyhow::bail!("Public key is not exchanged");
+        }
+        self.rsa.encrypt(data)
+    }
+
+    fn decrypt(&self, data: Vec<u8>) -> Result<String> {
+        if !self.prepared {
+            anyhow::bail!("Public key is not exchanged");
+        }
+        self.rsa.decrypt(data)
+    }
+}
+
+pub struct EcdhAesProvider {
+    pub ecdh: Ecdh,
+    aes: Option<AesCrypto>,
+}
+
+impl CryptoProvider for EcdhAesProvider {
+    fn initialize() -> Box<dyn CryptoProvider> {
+        // use secp256k1 for 32 bytes key for AES-256
+        let ecdh = Ecdh::new(Nid::SECP256K1).unwrap();
+        Box::new(Self { ecdh, aes: None })
+    }
+
+    fn prepare(&mut self, peer_public_key: Vec<u8>) {
+        if self.is_prepared() {
+            panic!("Public key is already exchanged");
+        }
+        let shared_secret = self.ecdh.derive_shared_secret(&peer_public_key).unwrap();
+        let key = shared_secret.iter().take(32).cloned().collect();
+        self.aes = Some(AesCrypto::new(key));
+    }
+
+    fn is_prepared(&self) -> bool {
+        self.aes.is_some()
+    }
+
+    fn public_key(&self) -> Result<Vec<u8>> {
+        self.ecdh.public_bytes()
+    }
+
+    fn encrypt(&self, data: String) -> Result<Vec<u8>> {
+        if self.aes.is_none() {
+            anyhow::bail!("AES key is not derived");
+        }
+        self.aes.as_ref().unwrap().encrypt(data)
+    }
+
+    fn decrypt(&self, data: Vec<u8>) -> Result<String> {
+        if self.aes.is_none() {
+            anyhow::bail!("AES key is not derived");
+        }
+        self.aes.as_ref().unwrap().decrypt(data)
+    }
+}
+
+pub struct EcdhDesProvider {
+    pub ecdh: Ecdh,
+    des: Option<DesCrypto>,
+}
+
+impl CryptoProvider for EcdhDesProvider {
+    fn initialize() -> Box<dyn CryptoProvider> {
+        // use secp384r1 for 24 bytes key for 3DES
+        let ecdh = Ecdh::new(Nid::SECP384R1).unwrap();
+        Box::new(Self { ecdh, des: None })
+    }
+
+    fn prepare(&mut self, peer_public_key: Vec<u8>) {
+        if self.is_prepared() {
+            panic!("Public key is already exchanged");
+        }
+        let shared_secret = self.ecdh.derive_shared_secret(&peer_public_key).unwrap();
+        // do xor to get 24 bytes key
+        let key: Vec<u8> = shared_secret
+            .iter()
+            .zip(shared_secret.iter().skip(24))
+            .map(|(a, b)| a ^ b)
+            .collect();
+        assert!(key.len() == 24, "Key length is not 24 bytes");
+        self.des = Some(DesCrypto::new(key));
+    }
+
+    fn is_prepared(&self) -> bool {
+        self.des.is_some()
+    }
+
+    fn public_key(&self) -> Result<Vec<u8>> {
+        self.ecdh.public_bytes()
+    }
+
+    fn encrypt(&self, data: String) -> Result<Vec<u8>> {
+        if self.des.is_none() {
+            anyhow::bail!("DES key is not derived");
+        }
+        self.des.as_ref().unwrap().encrypt(data)
+    }
+
+    fn decrypt(&self, data: Vec<u8>) -> Result<String> {
+        if self.des.is_none() {
+            anyhow::bail!("DES key is not derived");
+        }
+        self.des.as_ref().unwrap().decrypt(data)
     }
 }
 
