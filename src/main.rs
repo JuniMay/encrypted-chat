@@ -7,6 +7,12 @@ use crossterm::{
 };
 use crypto::{CryptoProvider, EcdhAesProvider, EcdhDesProvider, RsaProvider};
 use message::{Header, Message};
+use openssl::{
+    hash::MessageDigest,
+    pkey::{PKey, Public},
+    rsa::Rsa,
+    sign::{Signer, Verifier},
+};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -63,6 +69,9 @@ struct State {
     stream: Option<TcpStream>,
 
     pub crypto_provider: Box<dyn CryptoProvider>,
+    pub signer: Signer<'static>,
+    pub pubkey_for_sign: Vec<u8>,
+    pub peer_pubkey_for_sign: Option<PKey<Public>>,
 
     stopped: bool,
 }
@@ -153,6 +162,14 @@ impl State {
             CryptoKind::EcdhAes => EcdhAesProvider::initialize(),
             CryptoKind::EcdhDes => EcdhDesProvider::initialize(),
         };
+
+        let keypair = Rsa::generate(2048).unwrap();
+        let keypair = PKey::from_rsa(keypair).unwrap();
+
+        let signer = Signer::new(MessageDigest::sha256(), &keypair).unwrap();
+
+        let pubkey = keypair.public_key_to_pem().unwrap();
+
         Self {
             addr,
             port,
@@ -161,6 +178,9 @@ impl State {
             informations: Vec::new(),
             stream: None,
             crypto_provider: provider,
+            signer,
+            pubkey_for_sign: pubkey,
+            peer_pubkey_for_sign: None,
             stopped: false,
         }
     }
@@ -224,8 +244,9 @@ impl State {
                 .crypto_provider
                 .encrypt(self.curr_input.clone())
                 .unwrap();
-            let msg = Message::new(Header::Data, msg);
-            let msg = bincode::serialize(&msg).unwrap();
+            let signature = self.signer.sign_oneshot_to_vec(&msg).unwrap();
+            let msg = Message::new(Header::Data, msg, signature);
+            let msg = msg.serialize();
             stream.write(&msg).unwrap();
             self.user_msg(self.curr_input.clone());
             self.curr_input.clear();
@@ -246,8 +267,8 @@ impl State {
         self.info("Sending public key".to_string());
 
         let public_key = self.crypto_provider.public_key().unwrap();
-        let msg = Message::new(Header::Prepare, public_key);
-        let msg = bincode::serialize(&msg).unwrap();
+        let msg = Message::new(Header::Prepare, public_key, self.pubkey_for_sign.clone());
+        let msg = msg.serialize();
         self.stream.as_ref().unwrap().write(&msg).unwrap();
 
         self.info("Sent public key".to_string());
@@ -336,29 +357,63 @@ fn recv(tx: mpsc::Sender<Vec<u8>>, state: Arc<Mutex<State>>) {
                     let msg = buffer[..n].to_vec();
 
                     // deserialize the message
-                    let msg: Message = bincode::deserialize(&msg).unwrap();
+                    let msg = Message::deserialize(&msg);
 
                     match msg.header() {
                         Header::Prepare => {
                             state.info("Received public key".to_string());
 
                             if !state.crypto_provider.is_prepared() {
-                                state.crypto_provider.prepare(msg.into_data());
+                                let data = msg.data();
+                                let peer_pubkey = msg.signature();
+                                let peer_pubkey = PKey::public_key_from_pem(peer_pubkey).unwrap();
+
+                                // just debug
+                                state.info(format!(
+                                    "Peer public key for sign: {:?}",
+                                    peer_pubkey.public_key_to_der().unwrap().bytes()
+                                ));
+
+                                state.crypto_provider.prepare(data.to_vec());
+                                state.peer_pubkey_for_sign = Some(peer_pubkey);
+
+                                // send the public key
+                                state.info("Sending public key".to_string());
+                                let public_key = state.crypto_provider.public_key().unwrap();
+                                let msg = Message::new(
+                                    Header::Prepare,
+                                    public_key,
+                                    state.pubkey_for_sign.clone(),
+                                );
+                                let msg = msg.serialize();
+                                state.stream.as_ref().unwrap().write(&msg).unwrap();
+                                state.info("Sent public key".to_string());
                             }
-                            // send the public key
-                            state.info("Sending public key".to_string());
-                            let public_key = state.crypto_provider.public_key().unwrap();
-                            let msg = Message::new(Header::Prepare, public_key);
-                            let msg = bincode::serialize(&msg).unwrap();
-                            state.stream.as_ref().unwrap().write(&msg).unwrap();
-                            state.info("Sent public key".to_string());
                         }
                         Header::Data => {
                             let raw = msg.data();
 
                             state.info(format!("Received data: {:?}", raw));
 
-                            let decrypted = state.crypto_provider.decrypt(msg.into_data()).unwrap();
+                            let verified = if let Some(peer_pubkey) =
+                                state.peer_pubkey_for_sign.as_ref()
+                            {
+                                let signature = msg.signature();
+                                let mut verifier =
+                                    Verifier::new(MessageDigest::sha256(), peer_pubkey).unwrap();
+                                let verified = verifier.verify_oneshot(signature, raw).unwrap();
+                                verified
+                            } else {
+                                panic!("No public key for signature verification");
+                            };
+
+                            if verified {
+                                state.info("Signature verified".to_string());
+                            } else {
+                                state.error("Signature verification failed".to_string());
+                            }
+
+                            let decrypted = state.crypto_provider.decrypt(raw.to_vec()).unwrap();
                             tx.send(decrypted.into()).unwrap();
                         }
                     }
@@ -424,7 +479,7 @@ fn ui(frame: &mut Frame, state: Arc<Mutex<State>>) {
         .margin(1)
         .constraints(
             [
-                Constraint::Length(5),
+                Constraint::Length(20),
                 Constraint::Min(2),
                 Constraint::Length(3),
             ]
