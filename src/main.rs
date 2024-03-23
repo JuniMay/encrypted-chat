@@ -19,6 +19,9 @@ use std::{
     time::Duration,
 };
 
+mod crypto;
+mod message;
+
 #[derive(Parser)]
 struct Arg {
     #[arg(short, long, default_value_t = 4321)]
@@ -42,6 +45,7 @@ enum Command {
     Connect(String, u16),
     Quit,
 }
+
 
 fn main() -> Result<()> {
     let args = Arg::parse();
